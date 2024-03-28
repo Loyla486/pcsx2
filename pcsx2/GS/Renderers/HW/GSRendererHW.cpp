@@ -4022,9 +4022,9 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, bool& DAT
 							|| accumulation_blend; // Mix of hw/sw blending
 
 	// Blend can be done on hw. As and F cases should be accurate.
-	// BLEND_HW_CLR1 with Ad, BLEND_HW_CLR3 might require sw blend.
-	// BLEND_HW_CLR1 with As/F and BLEND_HW_CLR2 can be done in hw.
-	bool clr_blend1_2 = (blend_flag & (BLEND_HW_CLR1 | BLEND_HW_CLR2)) && (m_conf.ps.blend_c != 1) // As or Af cases only.
+	// BLEND_HW1 with Ad, BLEND_HW3 might require sw blend.
+	// BLEND_HW1 with As/F and BLEND_HW2 can be done in hw.
+	bool clr_blend1_2 = (blend_flag & (BLEND_HW1 | BLEND_HW2)) && (m_conf.ps.blend_c != 1) // As or Af cases only.
 						&& !(m_draw_env->PABE.PABE && GetAlphaMinMax().min < 128) // No PABE as it will require sw blending.
 						&& (COLCLAMP.CLAMP) // Let's add a colclamp check too, hw blend will clamp to 0-1.
 						&& !prefer_sw_blend; // Don't run if sw blend is preferred.
@@ -4302,6 +4302,7 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, bool& DAT
 
 			if (blend_mix1)
 			{
+				bool blend_can_second_pass = false;
 				if (m_conf.ps.blend_b == m_conf.ps.blend_d && (alpha_c0_high_min_one || alpha_c1_high_min_one || alpha_c2_high_one))
 				{
 					// Replace Cs*Alpha + Cd*(1 - Alpha) with Cs*Alpha - Cd*(Alpha - 1).
@@ -4315,19 +4316,60 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, bool& DAT
 				}
 				else if (m_conf.ps.blend_a == m_conf.ps.blend_d)
 				{
-					// Compensate slightly for Cd*(Alpha + 1) - Cs*Alpha.
-					m_conf.ps.blend_hw = 2;
+					if (no_prim_overlap)
+					{
+						// Render pass 1: Calculate Cd*(Alpha + 1) with an alpha range of 0-1.
+						m_conf.ps.blend_hw = 1;
+						m_conf.ps.blend_mix = 0;
+						m_conf.blend = {true, GSDevice::DST_COLOR, (m_conf.ps.blend_c == 2) ? GSDevice::CONST_COLOR : GSDevice::SRC1_COLOR, GSDevice::OP_ADD, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+						m_conf.blend = {true, GSDevice::DST_COLOR, (m_conf.ps.blend_c == 2) ? GSDevice::CONST_COLOR : GSDevice::SRC1_COLOR, GSDevice::OP_ADD, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+						// Render pass 2: Cd is result from render pass 1, preform addition or subtraction between Cs*Alpha and Cd.
+						m_conf.blend_second_pass.enable = true;
+						m_conf.blend_second_pass.blend = {true, blend.src, blend.dst, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+
+						blend_can_second_pass = true;
+					}
+					else
+					{
+						// Compensate slightly for Cd*(Alpha + 1) - Cs*Alpha.
+						m_conf.ps.blend_hw = 2;
+					}
+				}
+				else if (no_prim_overlap && (alpha_c0_high_max_one || alpha_c1_high_max_one || alpha_c2_high_one) && m_conf.ps.blend_d == 2)
+				{
+					// Render pass 1: Do (Cd - Cs) or (Cs - Cd) on first pass.
+					m_conf.ps.blend_mix = 0;
+					m_conf.blend = {true, GSDevice::CONST_ONE, GSDevice::CONST_ONE, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, false, 0};
+					// Render pass 2: Blend the result (Cd) from render pass 1 with al alpha range of 0-2.
+					m_conf.blend_second_pass.enable = true;
+					m_conf.blend_second_pass.blend_hw = 2;
+					m_conf.blend_second_pass.blend = {true, GSDevice::DST_COLOR, (m_conf.ps.blend_c == 2) ? GSDevice::CONST_COLOR : GSDevice::SRC1_COLOR, GSDevice::OP_ADD, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+					
+					m_conf.ps.blend_a = 0;
+					m_conf.ps.blend_b = 0;
+					m_conf.ps.blend_d = 0;
+
+					blend_can_second_pass = true;
 				}
 
-				m_conf.ps.blend_a = 0;
-				m_conf.ps.blend_b = 2;
-				m_conf.ps.blend_d = 2;
+				if (blend_can_second_pass)
+				{
+					m_conf.ps.blend_a = 0;
+					m_conf.ps.blend_b = 0;
+					m_conf.ps.blend_d = 0;
+				}
+				else
+				{
+					m_conf.ps.blend_a = 0;
+					m_conf.ps.blend_b = 2;
+					m_conf.ps.blend_d = 2;
+				}
 			}
 			else if (blend_mix2)
 			{
 				// Allow to compensate when Cs*(Alpha + 1) overflows, to compensate we change
 				// the alpha output value for Cd*Alpha.
-				m_conf.blend = {true, GSDevice::CONST_ONE, GSDevice::SRC1_COLOR, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO,false, 0};
+				m_conf.blend = {true, GSDevice::CONST_ONE, GSDevice::SRC1_COLOR, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, false, 0};
 				m_conf.ps.blend_hw = 3;
 				m_conf.ps.no_color1 = false;
 
@@ -4365,6 +4407,9 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, bool& DAT
 		m_conf.ps.blend_b = 0;
 		m_conf.ps.blend_d = 0;
 
+		const HWBlend blend = GSDevice::GetBlend(blend_index);
+		m_conf.blend = {true, blend.src, blend.dst, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+
 		const bool rta_correction = m_can_correct_alpha && !blend_ad_alpha_masked && m_conf.ps.blend_c == 1 && !(blend_flag & BLEND_A_MAX);
 		if (rta_correction)
 		{
@@ -4374,24 +4419,37 @@ void GSRendererHW::EmulateBlending(int rt_alpha_min, int rt_alpha_max, bool& DAT
 		}
 
 		// Care for hw blend value, 6 is for hw/sw, sw blending used.
-		if (blend_flag & BLEND_HW_CLR1)
+		if (blend_flag & BLEND_HW1)
 		{
 			m_conf.ps.blend_hw = 1;
 		}
-		else if (blend_flag & BLEND_HW_CLR2)
+		else if (blend_flag & BLEND_HW2)
 		{
 			if (m_conf.ps.blend_c == 2)
 				m_conf.cb_ps.TA_MaxDepth_Af.a = static_cast<float>(AFIX) / 128.0f;
 
 			m_conf.ps.blend_hw = 2;
 		}
-		else if (!rta_correction && (blend_flag & BLEND_HW_CLR3))
+		else if (!rta_correction && (blend_flag & BLEND_HW3))
 		{
 			m_conf.ps.blend_hw = 3;
 		}
+		else if (no_prim_overlap)
+		{
+			if ((alpha_c0_high_max_one || alpha_c1_high_max_one || alpha_c2_high_one) && (blend_flag & BLEND_HW4))
+			{
+				if (m_conf.ps.blend_c == 2)
+					m_conf.cb_ps.TA_MaxDepth_Af.a = static_cast<float>(AFIX) / 128.0f;
 
-		const HWBlend blend = GSDevice::GetBlend(blend_index);
-		m_conf.blend = {true, blend.src, blend.dst, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO,m_conf.ps.blend_c == 2, AFIX};
+				// Render pass 1: Calculate Cd*Alpha with an alpha range of 0-2.
+				m_conf.ps.blend_hw = 2;
+				m_conf.blend = {true, GSDevice::DST_COLOR, (m_conf.ps.blend_c == 2) ? GSDevice::CONST_COLOR : GSDevice::SRC1_COLOR, GSDevice::OP_ADD, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, m_conf.ps.blend_c == 2, AFIX};
+				// Render pass 2: Add or subtract result of render pass 1(Cd) from Cs.
+				m_conf.blend_second_pass.enable = true;
+				m_conf.blend_second_pass.blend_hw = 0;
+				m_conf.blend_second_pass.blend = {true, blend.src, GSDevice::CONST_ONE, blend.op, GSDevice::CONST_ONE, GSDevice::CONST_ZERO, false, 0};
+			}
+		}
 
 		// Remove second color output when unused. Works around bugs in some drivers (e.g. Intel).
 		m_conf.ps.no_color1 |= !GSDevice::IsDualSourceBlendFactor(m_conf.blend.src_factor) &&

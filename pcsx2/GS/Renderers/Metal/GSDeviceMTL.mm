@@ -2213,6 +2213,15 @@ void GSDeviceMTL::RenderHW(GSHWDrawConfig& config)
 
 	SendHWDraw(config, mtlenc, index_buffer, index_buffer_offset);
 
+	if (config.blend_second_pass.enable)
+	{
+		if (config.blend_second_pass.blend.constant_enable)
+			MRESetBlendColor(config.blend_second_pass.blend.constant);
+		config.ps.blend_hw = config.blend_second_pass.blend_hw;
+		MRESetHWPipelineState(config.vs, config.ps, config.blend_second_pass.blend, config.colormask);
+		SendHWDraw(config, mtlenc, index_buffer, index_buffer_offset);
+	}
+
 	if (config.alpha_second_pass.enable)
 	{
 		if (config.alpha_second_pass.ps_aref != config.cb_ps.FogColor_AREF.a)
